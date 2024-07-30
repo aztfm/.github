@@ -3,7 +3,7 @@ description: I have a suggestion to implement in this module
 title: Support for [thing]
 labels: enhancement
 projects: Roadmap
-assignees: [aztfm/2]
+assignees: ["aztfm/2"]
 body:
   - type: textarea
     id: description
