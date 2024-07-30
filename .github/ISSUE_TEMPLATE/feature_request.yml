@@ -1,0 +1,41 @@
+name: "🚀 Feature request"
+description: I have a suggestion to implement in this module
+title: Support for [thing]
+labels: enhancement
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Please leave a helpful description of the feature request here.
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: New or affected parameter(s)/configuration(s)
+      description: Please list the new or affected parameter(s) and/or configuration(s).
+      placeholder: parameter / parameter.subparameter
+  - type: textarea
+    id: config
+    attributes:
+      label: Potential Terraform Configuration
+      description: Please provide an example of what the new resource or enhancement could look like in a Terraform config.
+      render: hcl
+      placeholder: |        
+        module "example" {
+          source              = "aztfm/example/azurerm"
+          version             = ">=1.0.0"
+          resource_group_name = azurerm_resource_group.rg.name
+          location            = azurerm_resource_group.rg.location
+          tags                = azurerm_resource_group.rg.tags
+          example_parameter   = "something" # Example of parameter
+        }
+  - type: textarea
+    attributes:
+      label: References
+      description: Add any other context or screenshots about the feature request here.
+      placeholder: |
+        - https://registry.terraform.io/providers/hashicorp/azurerm/...
+        - https://github.com/hashicorp/terraform-provider-azurerm/...
+        - https://learn.microsoft.com/es-es/azure/...
+        - ...
