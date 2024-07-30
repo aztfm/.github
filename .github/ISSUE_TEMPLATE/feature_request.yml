@@ -2,6 +2,8 @@ name: "🚀 Feature request"
 description: I have a suggestion to implement in this module
 title: Support for [thing]
 labels: enhancement
+projects: Roadmap
+assignees: [gareda]
 body:
   - type: textarea
     id: description
