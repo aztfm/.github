@@ -1,0 +1,48 @@
+name: "🐛 Bug Report"
+description: I have found something that isn't working as expected.
+title: Support for [thing]
+labels: [bug]
+assignees: [gareda]
+body:
+  - type: textarea
+    id: description
+    validations:
+      required: true
+    attributes:
+      label: Description
+      description: Please leave a helpful description of the bug request here.
+
+  - type: input
+    id: module
+    validations:
+      required: true
+    attributes:
+      label: Module version
+      description: Which module version are you using?
+      placeholder: 1.0.0
+
+  - type: input
+    id: resource
+    validations:
+      required: true
+    attributes:
+      label: Affected component
+      description: Please list the affected resources and/or data sources.
+      placeholder: "resource: azurerm_xxxxx / parameter: name / output: id / ..."
+
+  - type: textarea
+    id: config
+    validations:
+      required: true
+    attributes:
+      label: Terraform configuration files
+      description: Please provide a minimal Terraform configuration that can reproduce the issue.
+      render: hcl
+
+  - type: textarea
+    id: debug
+    validations:
+      required: true
+    attributes:
+      label: Debug output
+      render: shell
