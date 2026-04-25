@@ -1,0 +1,510 @@
+name: "azurerm provider sync (reusable)"
+
+on:
+  workflow_call:
+
+jobs:
+  sync:
+    name: "Sync module with azurerm provider"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout module repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install openai requests
+
+      - name: Detect azurerm resources
+        id: detect
+        run: |
+          RESOURCES=$(grep -oP 'resource "\Kazurerm_[^"]+' main.tf | sort -u | tr '\n' ' ' | xargs)
+          echo "resources=${RESOURCES}" >> "$GITHUB_OUTPUT"
+          echo "Detected resources: ${RESOURCES}"
+
+      - name: Run provider sync analysis and generate PRs
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          AZURERM_RESOURCES: ${{ steps.detect.outputs.resources }}
+        run: |
+          python3 - <<'PYEOF'
+          import os
+          import re
+          import json
+          import subprocess
+          import textwrap
+          import requests
+          from openai import OpenAI
+
+          REPO          = os.environ["GITHUB_REPOSITORY"]
+          RESOURCES_RAW = os.environ.get("AZURERM_RESOURCES", "")
+          GH_TOKEN      = os.environ["GH_TOKEN"]
+          GH_HEADERS    = {"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json"}
+
+          # GitHub Models uses the OpenAI SDK with a custom endpoint
+          client = OpenAI(
+              base_url="https://models.inference.ai.azure.com",
+              api_key=GH_TOKEN,
+          )
+
+          # ── helpers ──────────────────────────────────────────────────────────
+
+          def run(cmd, check=True, capture=True):
+              r = subprocess.run(cmd, shell=True, capture_output=capture, text=True)
+              if check and r.returncode != 0:
+                  raise RuntimeError(f"Command failed: {cmd}\n{r.stderr}")
+              return r.stdout.strip() if capture else None
+
+          def branch_exists(branch):
+              r = subprocess.run(
+                  f"git ls-remote --heads origin {branch}",
+                  shell=True, capture_output=True, text=True
+              )
+              return branch in r.stdout
+
+          def read_file(path):
+              try:
+                  with open(path) as f:
+                      return f.read()
+              except FileNotFoundError:
+                  return ""
+
+          def write_file(path, content):
+              os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+              with open(path, "w") as f:
+                  f.write(content)
+
+          def llm(model, prompt, max_tokens=4096):
+              response = client.chat.completions.create(
+                  model=model,
+                  max_tokens=max_tokens,
+                  temperature=0,
+                  messages=[{"role": "user", "content": prompt}],
+              )
+              raw = response.choices[0].message.content.strip()
+              raw = re.sub(r"^```(?:json)?\s*", "", raw)
+              raw = re.sub(r"\s*```$", "", raw)
+              return raw
+
+          def fetch_provider_docs(resource_type):
+              """Download provider docs markdown from hashicorp/terraform-provider-azurerm."""
+              name = resource_type.removeprefix("azurerm_")
+              candidates = [name, name.rstrip("s"), name + "s"]
+              base_url = "https://raw.githubusercontent.com/hashicorp/terraform-provider-azurerm/main/website/docs/r"
+              for candidate in candidates:
+                  url = f"{base_url}/{candidate}.html.markdown"
+                  r = requests.get(url, timeout=30)
+                  if r.status_code == 200:
+                      return r.text
+              return ""
+
+          def llm_analyze_gaps(module_files, resource_docs_map, readme):
+              """gpt-4o-mini: identify gaps between module and current provider docs."""
+              docs_section = "\n\n".join(
+                  f"## Provider docs for {rt}\n{docs[:6000]}"
+                  for rt, docs in resource_docs_map.items() if docs
+              )
+              prompt = textwrap.dedent(f"""
+                  You are an expert in HashiCorp Terraform and the azurerm provider.
+
+                  ## Module purpose
+                  {readme[:800]}
+
+                  ## Current module implementation
+                  ### variables.tf
+                  {module_files.get("variables.tf", "(empty)")}
+
+                  ### main.tf
+                  {module_files.get("main.tf", "(empty)")}
+
+                  ### outputs.tf
+                  {module_files.get("outputs.tf", "(empty)")}
+
+                  ### locals.tf
+                  {module_files.get("locals.tf", "(empty)")}
+
+                  ## Current azurerm provider documentation
+                  {docs_section}
+
+                  ## Task
+                  Compare the current module implementation against the provider documentation.
+                  Identify ALL gaps: missing features, deprecated attributes, new SKUs/tiers,
+                  changed validation constraints, new required sub-blocks.
+
+                  Consider the module as a WHOLE — a gap may require changes to multiple Terraform
+                  resources if they implement the same Azure concept together.
+
+                  Return ONLY a JSON array. Each element:
+                  {{
+                    "gap_id": "short-kebab-slug",
+                    "type": "MISSING_FEATURE | DEPRECATED | SKU_CHANGE | VALIDATION_CHANGE",
+                    "title": "one-line human description",
+                    "description": "2-4 sentences explaining the gap",
+                    "terraform_resources_affected": ["azurerm_foo", "azurerm_bar"],
+                    "provider_attributes": ["attr1", "block.attr2"],
+                    "azure_feature_name": "Name of the Azure feature/capability"
+                  }}
+
+                  Return [] if no gaps are found. Return ONLY the JSON array, no other text.
+              """).strip()
+
+              return json.loads(llm("gpt-4o-mini", prompt, max_tokens=4096))
+
+          def llm_group_gaps(gaps, module_files, resource_docs_map):
+              """gpt-4o: group gaps by functional Azure relationship, cross-resource aware."""
+              if not gaps:
+                  return []
+
+              docs_section = "\n\n".join(
+                  f"## {rt} docs excerpt\n{docs[:3000]}"
+                  for rt, docs in resource_docs_map.items() if docs
+              )
+              prompt = textwrap.dedent(f"""
+                  You are an expert in Azure services and HashiCorp Terraform.
+
+                  ## Identified gaps in the module
+                  {json.dumps(gaps, indent=2)}
+
+                  ## Azure provider documentation context
+                  {docs_section[:8000]}
+
+                  ## Module main.tf (for context on resource relationships)
+                  {module_files.get("main.tf", "")}
+
+                  ## Task
+                  Group the gaps above into pull request units. Each PR should implement
+                  ONE coherent Azure feature or fix ONE logical issue.
+
+                  GROUPING RULES:
+                  - Group gaps that MUST be implemented together because:
+                    * They are parts of the same Azure feature (e.g., blob soft-delete + versioning share the blob_properties block)
+                    * One gap only makes sense when the other exists (functional dependency in Azure)
+                    * They affect different Terraform resources but configure the SAME Azure capability
+                      (e.g., a subnet feature that also requires a flag on the parent virtual network)
+                  - Keep gaps SEPARATE when they are independent Azure features, even if on the same resource
+                  - A single gap = a single PR unless it has a direct functional dependency
+
+                  For each group, determine:
+                  - A stable kebab-case feature_slug based on the Azure feature name (NOT version-based)
+                  - The primary Terraform resource for branch naming
+                  - Whether this is feat (new capability), fix (deprecated/broken), or refactor
+
+                  Return ONLY a JSON array. Each element:
+                  {{
+                    "feature_slug": "stable-kebab-slug",
+                    "pr_type": "feat | fix | refactor",
+                    "title": "imperative sentence describing the change",
+                    "primary_resource": "azurerm_most_central_resource",
+                    "grouping_reason": null,
+                    "gap_ids": ["gap-id-1"],
+                    "gaps": [/* full gap objects */]
+                  }}
+
+                  Set grouping_reason to null for single-gap PRs, or explain the functional
+                  dependency for multi-gap PRs.
+
+                  Return ONLY the JSON array, no other text.
+              """).strip()
+
+              return json.loads(llm("gpt-4o", prompt, max_tokens=4096))
+
+          def llm_generate_code(group, module_files, resource_docs_map):
+              """gpt-4o: generate modified Terraform files for a group of related gaps."""
+              docs_section = "\n\n".join(
+                  f"## Provider docs for {rt}\n{docs[:5000]}"
+                  for rt, docs in resource_docs_map.items() if docs
+              )
+              agents_md = read_file("AGENTS.md")
+              prompt = textwrap.dedent(f"""
+                  You are an expert Terraform module author specializing in the azurerm provider.
+                  Follow ALL conventions described below.
+
+                  ## Module conventions (AGENTS.md)
+                  {agents_md}
+
+                  ## Change to implement
+                  {json.dumps(group, indent=2)}
+
+                  ## Current module files
+
+                  ### variables.tf
+                  {module_files.get("variables.tf", "(empty)")}
+
+                  ### main.tf
+                  {module_files.get("main.tf", "(empty)")}
+
+                  ### outputs.tf
+                  {module_files.get("outputs.tf", "(empty)")}
+
+                  ### locals.tf
+                  {module_files.get("locals.tf", "(empty)")}
+
+                  ### CHANGELOG.md
+                  {module_files.get("CHANGELOG.md", "(empty)")}
+
+                  ### tests/testing.tftest.hcl
+                  {module_files.get("tests/testing.tftest.hcl", "(empty)")}
+
+                  ## Provider documentation
+                  {docs_section}
+
+                  ## Implementation rules
+
+                  VARIABLES:
+                  - Use object({{...}}) with optional() for complex optional variables
+                  - Use list(object({{...}})) with for_each for repeatable sub-resources
+                  - Add validation blocks with contains() or can(regex()) as appropriate
+                  - Cross-resource validations go at the end of the relevant variable
+                  - All variables have type and description. Optional ones have default = null or default = []
+
+                  MAIN.TF:
+                  - Optional single blocks: dynamic "block" {{ for_each = var.x != null ? [""] : [] }}
+                  - Repeatable sub-resources: for_each = {{ for item in var.list : item.name => item }}
+                  - Never use count for resources that have a name attribute
+                  - Never declare a provider block
+                  - Reference child resources via the primary resource, not var.*
+
+                  OUTPUTS:
+                  - Every output has value and description
+                  - Collection outputs are maps keyed by name
+
+                  CHANGELOG:
+                  - Add entry at the top under the correct section: FEATURES:, ENHANCEMENTS:, or BREAKING CHANGES:
+                  - Format: * **New Parameter:** `variable_name` (for FEATURES)
+                  - Keep all existing entries unchanged
+
+                  TESTS:
+                  - Add assert blocks for new parameters in the existing run "plan" block
+                  - Assert message: "The <resource_short_name> <attribute> input variable is being modified."
+                  - Only add assert if the attribute is verifiable at plan time
+
+                  Return ONLY a JSON object. Include only files that actually change (null to skip).
+                  Also include a terraform_example field with a minimal HCL snippet showing how to
+                  use the new parameter(s) in a module block — similar to the placeholder in the
+                  feature request template.
+                  {{
+                    "variables.tf": "complete new file content or null",
+                    "main.tf": "complete new file content or null",
+                    "outputs.tf": "complete new file content or null",
+                    "locals.tf": "complete new file content or null",
+                    "CHANGELOG.md": "complete new file content or null",
+                    "tests/testing.tftest.hcl": "complete new file content or null",
+                    "terraform_example": "minimal HCL module block showing the new parameter(s)"
+                  }}
+
+                  Return ONLY the JSON object, no other text.
+              """).strip()
+
+              return json.loads(llm("gpt-4o", prompt, max_tokens=8192))
+
+          def create_pr(branch, title, body, base="main"):
+              url = f"https://api.github.com/repos/{REPO}/pulls"
+              payload = {"title": title, "body": body, "head": branch, "base": base}
+              r = requests.post(url, headers=GH_HEADERS, json=payload, timeout=30)
+              if r.status_code == 201:
+                  return r.json()["html_url"]
+              elif r.status_code == 422 and "already exists" in r.text:
+                  return "(PR already exists)"
+              else:
+                  raise RuntimeError(f"PR creation failed: {r.status_code} {r.text}")
+
+          def build_pr_body(group, resource_docs_map, code):
+              # Affected parameters (new + modified)
+              all_attrs = []
+              for g in group["gaps"]:
+                  all_attrs.extend(g.get("provider_attributes", []))
+              params_md = " / ".join(dict.fromkeys(all_attrs)) or "—"
+
+              # Change type badge
+              type_labels = {"feat": "🚀 New feature", "fix": "🐛 Bug fix / Deprecation", "refactor": "🔧 Refactor"}
+              change_type = type_labels.get(group["pr_type"], group["pr_type"])
+
+              # Checkboxes: one per gap, pre-ticked
+              changes_md = "\n".join(
+                  f"- [x] **{g['type']}**: {g['title']}"
+                  for g in group["gaps"]
+              )
+
+              # Affected resources
+              resources_md = ", ".join(
+                  f"`{r}`" for r in dict.fromkeys(
+                      r for g in group["gaps"] for r in g.get("terraform_resources_affected", [])
+                  )
+              )
+
+              # Terraform example from LLM-3 output
+              tf_example = (code or {}).get("terraform_example") or textwrap.dedent("""
+                  module \"example\" {
+                    source              = \"aztfm/example/azurerm\"
+                    version             = \">=1.0.0\"
+                    resource_group_name = azurerm_resource_group.rg.name
+                    location            = azurerm_resource_group.rg.location
+                    tags                = azurerm_resource_group.rg.tags
+                    # new parameter(s) here
+                  }
+              """).strip()
+
+              # References
+              docs_links = "\n".join(
+                  f"- [azurerm provider — {rt}](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/{rt.removeprefix('azurerm_')})"
+                  for rt in resource_docs_map
+              )
+              azure_hints = "\n".join(
+                  f"- {g.get('azure_feature_name', '')} — https://learn.microsoft.com/en-us/azure/search/index?search={g.get('azure_feature_name','').replace(' ','+')}"
+                  for g in group["gaps"] if g.get("azure_feature_name")
+              )
+
+              grouping_note = (
+                  f"\n> **Note**: {group['grouping_reason']}\n"
+                  if group.get("grouping_reason") else ""
+              )
+
+              return textwrap.dedent(f"""
+                  ## Description
+
+                  {change_type} — automated sync of **{resources_md}** with the current azurerm provider.{grouping_note}
+                  {"\n".join(g["description"] for g in group["gaps"])}
+
+                  ## New or affected parameter(s) / configuration(s)
+
+                  `{params_md}`
+
+                  ## Changes included
+
+                  {changes_md}
+
+                  ## Potential terraform configuration
+
+                  ```hcl
+                  {tf_example}
+                  ```
+
+                  ## References
+
+                  {docs_links}
+                  {azure_hints}
+
+                  ---
+                  *This PR was generated automatically by the [azurerm provider sync workflow](https://github.com/{REPO}/actions).*
+              """).strip()
+
+          # ── main flow ─────────────────────────────────────────────────────────
+
+          resources = [r for r in RESOURCES_RAW.split() if r]
+          if not resources:
+              print("No azurerm resources detected in main.tf — nothing to do.")
+              exit(0)
+
+          print(f"Resources to analyze: {resources}")
+
+          # 1. Load module files
+          module_files = {
+              "variables.tf":             read_file("variables.tf"),
+              "main.tf":                  read_file("main.tf"),
+              "outputs.tf":               read_file("outputs.tf"),
+              "locals.tf":                read_file("locals.tf"),
+              "CHANGELOG.md":             read_file("CHANGELOG.md"),
+              "tests/testing.tftest.hcl": read_file("tests/testing.tftest.hcl"),
+          }
+          readme = read_file("README.md")
+
+          # 2. Fetch provider docs for all resources
+          print("Fetching provider documentation...")
+          resource_docs_map = {}
+          for rt in resources:
+              print(f"  Fetching docs for {rt}...")
+              resource_docs_map[rt] = fetch_provider_docs(rt)
+
+          # 3. LLM-1: gap analysis — gpt-4o-mini (cheap, structural comparison)
+          print("Running gap analysis (gpt-4o-mini)...")
+          gaps = llm_analyze_gaps(module_files, resource_docs_map, readme)
+          print(f"Gaps found: {len(gaps)}")
+          if not gaps:
+              print("No gaps detected — module is up to date.")
+              exit(0)
+
+          for g in gaps:
+              print(f"  [{g['type']}] {g['gap_id']}: {g['title']}")
+
+          # 4. LLM-2: group by functional Azure relationship — gpt-4o (cross-resource reasoning)
+          print("Grouping gaps by Azure feature (gpt-4o)...")
+          groups = llm_group_gaps(gaps, module_files, resource_docs_map)
+          print(f"PR groups: {len(groups)}")
+
+          # 5. Process each group
+          run("git config user.name 'github-actions[bot]'", check=False)
+          run("git config user.email 'github-actions[bot]@users.noreply.github.com'", check=False)
+
+          for group in groups:
+              primary  = group["primary_resource"].removeprefix("azurerm_")
+              slug     = group["feature_slug"]
+              pr_type  = group["pr_type"]
+              branch   = f"provider-sync/{primary}/{slug}"
+              pr_title = f"{pr_type}: {group['title']}"
+
+              print(f"\nProcessing group: {branch}")
+
+              # Deduplication: skip if branch already exists (open PR or previously merged feature)
+              if branch_exists(branch):
+                  print(f"  Branch {branch} already exists — skipping")
+                  continue
+
+              # Only use docs for resources affected by this group
+              affected_resources = list({
+                  r for g in group["gaps"]
+                  for r in g.get("terraform_resources_affected", [])
+              })
+              group_docs = {rt: resource_docs_map.get(rt, "") for rt in affected_resources}
+
+              # 6. LLM-3: generate code — gpt-4o (maximum quality)
+              print("  Generating code (gpt-4o)...")
+              try:
+                  code = llm_generate_code(group, module_files, group_docs)
+              except Exception as e:
+                  print(f"  Code generation failed: {e} — skipping group")
+                  continue
+
+              # 7. Write files, commit, push
+              # terraform_example is metadata for the PR body only — not a real file
+              TERRAFORM_FILES = {"variables.tf", "main.tf", "outputs.tf", "locals.tf",
+                                 "CHANGELOG.md", "tests/testing.tftest.hcl"}
+              run(f"git checkout -b {branch}")
+              changed_files = []
+              for filepath, content in code.items():
+                  if filepath not in TERRAFORM_FILES or content is None:
+                      continue
+                  write_file(filepath, content)
+                  changed_files.append(filepath)
+                  print(f"  Modified: {filepath}")
+
+              if not changed_files:
+                  print("  No files changed — skipping")
+                  run("git checkout main")
+                  continue
+
+              run(f"git add {' '.join(changed_files)}")
+              commit_msg = f"{pr_type}: {group['title']}\n\nAffected resources: {', '.join(affected_resources)}"
+              run(f"git commit -m {json.dumps(commit_msg)}")
+              run(f"git push origin {branch}")
+
+              # 8. Open PR
+              body = build_pr_body(group, group_docs, code)
+              pr_url = create_pr(branch, pr_title, body)
+              print(f"  PR created: {pr_url}")
+
+              run("git checkout main")
+
+          print("\nSync complete.")
+          PYEOF
